@@ -1,3 +1,4 @@
+#include "KaleidoscopeJIT.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/BasicBlock.h"
@@ -27,6 +28,7 @@
 #include <vector>
 
 using namespace llvm;
+using namespace llvm::orc;
 
 // Unknown tokens are represented by their ASCII code
 enum Token {
@@ -285,6 +287,7 @@ static int GetTokPrecedence() {
     return TokPrec;
 }
 
+// Shaunting yard algorithm for operator precedence
 static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec, std::unique_ptr<ExprAST> LHS) {
     while (true) {
         int TokPrec = GetTokPrecedence();
@@ -366,7 +369,7 @@ static std::unique_ptr<PrototypeAST> ParseExtern() {
 static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
     if (auto E = ParseExpression()) {
         // Make an anoynomous proto
-        auto Proto = std::make_unique<PrototypeAST>("", std::vector<std::string>());
+        auto Proto = std::make_unique<PrototypeAST>("__anon_expr", std::vector<std::string>());
         return std::make_unique<FunctionAST>(std::move(Proto), std::move(E));
     }
     return nullptr;
@@ -376,11 +379,13 @@ static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
 // Code Generation
 //===----------------------------------------------------------------------===//
 
-static std::unique_ptr<LLVMContext> TheContext;
+static LLVMContext TheContext;
 static std::unique_ptr<Module> TheModule;
 static std::unique_ptr<IRBuilder<>> Builder;
 static std::map<std::string, Value *> NamedValues;
 static std::unique_ptr<legacy::FunctionPassManager> TheFPM;
+static std::unique_ptr<KaleidoscopeJIT> TheJIT;
+static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
 
 Value *LogErrorV(const char *Str) {
   LogError(Str);
@@ -388,7 +393,7 @@ Value *LogErrorV(const char *Str) {
 }
 
 Value *NumberExprAST::codegen() {
-    return ConstantFP::get(*TheContext, APFloat(Val));
+    return ConstantFP::get(TheContext, APFloat(Val));
 }
 
 Value *VariableExprAST::codegen() {
@@ -413,14 +418,28 @@ Value *BinaryExprAST::codegen() {
         case '<': 
             L = Builder->CreateFCmpULT(L, R, "cmptmp");
             // Convert bool 0/1  to double 0.0 or 1.0
-            return Builder->CreateUIToFP(L, Type::getDoubleTy(*TheContext), "booltmp");
+            return Builder->CreateUIToFP(L, Type::getDoubleTy(TheContext), "booltmp");
         default: return LogErrorV("invalid binary operator");
     }
 }
 
+Function *getFunction(std::string Name) {
+  // First, check if the function has already been added to the current module
+  if (auto *F = TheModule->getFunction(Name))
+    return F;
+
+  // If not, check if we can codegen the declaration from an existing prototype
+  auto FI = FunctionProtos.find(Name);
+  if (FI != FunctionProtos.end())
+    return FI->second->codegen();
+
+  // If no existing prototype exists, return null
+  return nullptr;
+}
+
 Value *CallExprAST::codegen() {
     // Look up the function name in the global module table
-    Function *CalleeF = TheModule->getFunction(Callee);
+    Function *CalleeF = getFunction(Callee);
     if (!CalleeF)
         return LogErrorV("Unknown function referenced");
 
@@ -440,10 +459,14 @@ Value *CallExprAST::codegen() {
 }
 
 Function *PrototypeAST::codegen() {
-    std::vector<Type*> Doubles(Args.size(), Type::getDoubleTy(*TheContext));
+    // Creates a vector of "N" LLVM double types.
+    std::vector<Type*> Doubles(Args.size(), Type::getDoubleTy(TheContext));
 
-    FunctionType *FT = FunctionType::get(Type::getDoubleTy(*TheContext), Doubles, false);
+    // The call to FunctionType::get creates the FunctionType that should be used for a given Prototype. False indicates not vararg
+    FunctionType *FT = FunctionType::get(Type::getDoubleTy(TheContext), Doubles, false);
 
+    // Creates the IR function corresponding to the Prototype.
+    // "external linkage" means that the function may be found outside the current module and/or that it is callable by functions outside the module
     Function *F = Function::Create(FT, Function::ExternalLinkage, Name, TheModule.get());
 
     unsigned Idx = 0;
@@ -454,11 +477,10 @@ Function *PrototypeAST::codegen() {
 }
 
 Function *FunctionAST::codegen() {
-    Function *TheFunction = TheModule->getFunction(Proto->getName());
+    std::string ProtoName = Proto->getName();
+    FunctionProtos[ProtoName] = std::move(Proto);
+    Function *TheFunction = getFunction(ProtoName);
 
-    if (!TheFunction)
-        TheFunction = Proto->codegen();
-    
     if (!TheFunction)
         return nullptr;
     
@@ -466,7 +488,7 @@ Function *FunctionAST::codegen() {
         return (Function*)LogErrorV("Funciton cannot be redefined");
 
     // Create a new basic block to start insertion into.
-    BasicBlock *BB = BasicBlock::Create(*TheContext, "entry", TheFunction);
+    BasicBlock *BB = BasicBlock::Create(TheContext, "entry", TheFunction);
     Builder->SetInsertPoint(BB);
 
     // Record the function arguments in the NamedValues map.
@@ -496,11 +518,11 @@ Function *FunctionAST::codegen() {
 
 void InitializeModuleAndPassManager(void) {
   // Open a new context and module.
-  TheContext = std::make_unique<LLVMContext>();
-  TheModule = std::make_unique<Module>("my cool jit", *TheContext);
+  TheModule = std::make_unique<Module>("my cool jit", TheContext);
+  TheModule->setDataLayout(TheJIT->getTargetMachine().createDataLayout());
 
   // Create a new builder for the module.
-  Builder = std::make_unique<IRBuilder<>>(*TheContext);
+  Builder = std::make_unique<IRBuilder<>>(TheContext);
 
   // Create a new pass manager attached to it.
   TheFPM = std::make_unique<legacy::FunctionPassManager>(TheModule.get());
@@ -520,9 +542,11 @@ void InitializeModuleAndPassManager(void) {
 static void HandleDefinition() {
   if (auto FnAST = ParseDefinition()) {
     if (auto *FnIR = FnAST->codegen()) {
-      fprintf(stderr, "Read function definition:");
+      fprintf(stderr, "Read function definition:\n");
       FnIR->print(errs());
       fprintf(stderr, "\n");
+      TheJIT->addModule(std::move(TheModule));
+      InitializeModuleAndPassManager();
     }
   } else {
     // Skip token for error recovery.
@@ -533,9 +557,10 @@ static void HandleDefinition() {
 static void HandleExtern() {
   if (auto ProtoAST = ParseExtern()) {
     if (auto *FnIR = ProtoAST->codegen()) {
-      fprintf(stderr, "Read extern: ");
+      fprintf(stderr, "Read extern:\n");
       FnIR->print(errs());
       fprintf(stderr, "\n");
+      FunctionProtos[ProtoAST->getName()] = std::move(ProtoAST);
     }
   } else {
     // Skip token for error recovery.
@@ -547,12 +572,24 @@ static void HandleTopLevelExpression() {
   // Evaluate a top-level expression into an anonymous function.
   if (auto FnAST = ParseTopLevelExpr()) {
     if (auto *FnIR = FnAST->codegen()) {
-      fprintf(stderr, "Read top-level expression:");
+      fprintf(stderr, "Read top level expression:\n");
       FnIR->print(errs());
       fprintf(stderr, "\n");
 
-      // Remove the anonymous expression.
-      FnIR->eraseFromParent();
+      auto H = TheJIT->addModule(std::move(TheModule));
+
+      InitializeModuleAndPassManager();
+
+      // Search the JIT for the __anon_expr symbol
+      auto ExprSymbol = TheJIT->findSymbol("__anon_expr");
+      assert(ExprSymbol && "Function not found");
+
+      // Get the symbol's address and cast it to a function pointer so that we can call it as a native function
+      double (*FP)() = (double (*)())(intptr_t)cantFail(ExprSymbol.getAddress());
+      fprintf(stderr, "Evaluated to %f\n", FP());
+
+      // Delete the anoymous expression module from the JIT
+      TheJIT->removeModule(H);
     }
   } else {
     // Skip token for error recovery.
@@ -588,7 +625,11 @@ static void MainLoop() {
 //===----------------------------------------------------------------------===//
 
 int main() {
-// Install standard binary operators.
+  InitializeNativeTarget();
+  InitializeNativeTargetAsmPrinter();
+  InitializeNativeTargetAsmParser();
+  
+  // Install standard binary operators.
   // 1 is lowest precedence.
   BinopPrecedence['<'] = 10;
   BinopPrecedence['+'] = 20;
@@ -599,9 +640,11 @@ int main() {
   fprintf(stderr, "ready> ");
   getNextToken();
 
+  TheJIT = std::make_unique<KaleidoscopeJIT>();
+
   // Make the module, which holds all the code.
   InitializeModuleAndPassManager();
-
+  
   // Run the main "interpreter loop" now.
   MainLoop();
 
